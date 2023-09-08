@@ -7,6 +7,7 @@ from operator import itemgetter
 import binascii
 import string
 import datetime
+import math
 
 from ..parser import EXTENSION_MARKER
 from . import BaseType, format_bytes, ErrorWithLocation
@@ -70,7 +71,6 @@ def integer_as_number_of_bits(size):
     integer.
 
     """
-
     if size == 0:
         return 0
     else:
@@ -334,11 +334,23 @@ class Encoder(object):
                                         value,
                                         minimum,
                                         maximum,
-                                        number_of_bits):
-        _range = (maximum - minimum + 1)
+                                        number_of_bits,
+                                        isSemi=False):
+        if(maximum == 'MAX'):
+            _range = 65537
+        else:
+            _range = (maximum - minimum + 1)
         value -= minimum
-
-        if _range <= 255:
+        if isSemi:
+            self.align_always()
+            if value == 0 or value == 1:
+                number_of_bytes = 1
+            else:
+                number_of_bytes = math.ceil(math.log(value)/math.log(256))
+            number_of_bits = number_of_bytes * 8
+            self.append_length_determinant(number_of_bytes) 
+            self.append_non_negative_binary_integer(value, number_of_bits) 
+        elif _range <= 255:
             self.append_non_negative_binary_integer(value, number_of_bits)
         elif _range == 256:
             self.align_always()
@@ -525,12 +537,12 @@ class Decoder(object):
 
         return value + minimum
 
-    def read_unconstrained_whole_number(self):
+    def read_unconstrained_whole_number(self, isSemi=False):
         length = self.read_length_determinant()
         decoded = self.read_non_negative_binary_integer(8 * length)
         number_of_bits = (8 * length)
 
-        if decoded & (1 << (number_of_bits - 1)):
+        if not isSemi and decoded & (1 << (number_of_bits - 1)):
             mask = ((1 << number_of_bits) - 1)
             decoded = (decoded - mask)
             decoded -= 1
@@ -1011,6 +1023,7 @@ class Integer(Type):
         super(Integer, self).__init__(name, 'INTEGER')
         self.minimum = None
         self.maximum = None
+        self.isSemi = False
         self.has_extension_marker = False
         self.number_of_bits = None
         self.number_of_indefinite_bits = None
@@ -1018,19 +1031,24 @@ class Integer(Type):
     def set_restricted_to_range(self, minimum, maximum, has_extension_marker):
         self.has_extension_marker = has_extension_marker
 
-        if minimum == 'MIN' or maximum == 'MAX':
-            return
-
         self.minimum = minimum
         self.maximum = maximum
-        size = self.maximum - self.minimum
-        self.number_of_bits = integer_as_number_of_bits(size)
-
-        if size <= 65535:
-            self.number_of_indefinite_bits = None
+        # if minimum == 'MIN' or maximum == 'MAX':
+        #     return
+        size = None
+        if minimum == 'MIN':
+            return
+        if maximum == 'MAX':
+            self.isSemi = True
         else:
-            number_of_bits = ((self.number_of_bits + 7) // 8 - 1).bit_length()
-            self.number_of_indefinite_bits = number_of_bits
+            size = self.maximum - self.minimum
+            self.number_of_bits = integer_as_number_of_bits(size)
+            if size <= 65535:
+                self.number_of_indefinite_bits = None
+            else:
+                number_of_bits = ((self.number_of_bits + 7) // 8 - 1).bit_length()
+                self.number_of_indefinite_bits = number_of_bits
+            
 
     def encode(self, data, encoder):
         if self.has_extension_marker:
@@ -1042,11 +1060,11 @@ class Integer(Type):
                 encoder.append_unconstrained_whole_number(data)
                 return
 
-        if self.number_of_bits is None:
+        if self.number_of_bits is None and not self.isSemi:
             encoder.align()
             encoder.append_unconstrained_whole_number(data)
         else:
-            if self.number_of_indefinite_bits is None:
+            if self.number_of_indefinite_bits is None or self.isSemi == True:
                 number_of_bits = self.number_of_bits
             else:
                 number_of_bytes = size_as_number_of_bytes(data - self.minimum)
@@ -1057,11 +1075,11 @@ class Integer(Type):
                     2 ** self.number_of_indefinite_bits,
                     self.number_of_indefinite_bits)
                 encoder.align()
-
             encoder.append_constrained_whole_number(data,
                                                     self.minimum,
                                                     self.maximum,
-                                                    number_of_bits)
+                                                    number_of_bits,
+                                                    isSemi=self.isSemi)
 
     def decode(self, decoder):
         if self.has_extension_marker:
@@ -1073,7 +1091,7 @@ class Integer(Type):
         if self.number_of_bits is None:
             decoder.align()
 
-            return decoder.read_unconstrained_whole_number()
+            return decoder.read_unconstrained_whole_number(isSemi=self.isSemi)
         else:
             if self.number_of_indefinite_bits is None:
                 number_of_bits = self.number_of_bits
